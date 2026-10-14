@@ -56,6 +56,9 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_log.h"
 #include "esp_lv_adapter.h"
+#include "muse_settings.h"
+#include "muse_audio.h"
+#include "muse_menu.h"
 #include "esp_sleep.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -88,9 +91,18 @@ static const char *TAG = "board";
 #define TCA9555_REG_CONFIG1 0x07
 #define TCA_BL_BIT   0  /* P0.0: LCD backlight, output, active high */
 #define TCA_P1_BIT   1  /* P0.1: pulsed low/high at init per proven donor; left output-high */
-#define TCA_BTNA_BIT 2  /* P0.2: button A, input, active low */
-/* P1.4 (pin 12): button B, input, active low. Wired but intentionally not
- * polled: it has no function yet. */
+#define TCA_BTNA_BIT 2  /* P0.2: input, active low. NOTE: software calls this "A"
+                         * but hardware verification (2026-10-06) proves P0.2 =
+                         * PHYSICAL B (the PTT button). Do not rename the symbol;
+                         * use PHYSICAL_B below for new code. */
+#define TCA9555_REG_INPUT1 0x01
+/* Physical button mapping (hardware-verified 2026-10-06):
+ *   PHYSICAL_A = TCA9555 P1.4 (pin 12), active-low. Volume/menu button.
+ *   PHYSICAL_B = TCA9555 P0.2, active-low. PTT button (existing, unchanged).
+ * The old TCA_BTNA_BIT symbol name is reversed vs. physical labels; it is
+ * kept for the proven PTT path. New code uses PHYSICAL_A/B. */
+#define PHYSICAL_A_BIT 4  /* P1.4 */
+#define PHYSICAL_B_BIT 2  /* P0.2 (same as TCA_BTNA_BIT) */
 
 #define I2S_MCLK GPIO_NUM_3
 #define I2S_BCLK GPIO_NUM_0   /* also BOOT: never a runtime button */
@@ -380,23 +392,158 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
 static bool s_a_pressed = false;
 static uint8_t s_a_stable = 0;
 
+/* Physical A (P1.4) gesture state machine.
+ * Poll rate: 10ms (POLL_MS in muse_input.c), 50ms when display paused.
+ * Timings below assume 10ms; at 50ms they scale 5x (still usable).
+ */
+#define PHYA_DEBOUNCE_TICKS 3    /* 30ms: match existing P0.2 debounce */
+#define PHYA_LONG_TICKS     80   /* 800ms: hold -> volume-up mode */
+#define PHYA_DOUBLE_TICKS   40   /* 400ms: second press -> double-click */
+#define PHYA_REPEAT_TICKS   15   /* 150ms: volume-up repeat while held */
+#define PHYA_VOL_STEP       5    /* volume step percent */
+
+static bool s_phya_pressed = false;      /* debounced P1.4 state */
+static uint8_t s_phya_stable = 0;        /* debounce counter */
+static uint16_t s_phya_hold = 0;         /* ticks held (for long-press) */
+static uint16_t s_phya_repeat = 0;       /* ticks since last repeat */
+static uint16_t s_phya_double = 0;       /* ticks since last short release */
+static bool s_phya_long = false;         /* in long-press volume-up mode */
+static bool s_phya_vol_live = false;     /* live volume applied, needs persist on release */
+static int s_phya_live_vol = -1;           /* live volume during hold-repeat (-1 = not tracking) */
+
+/* Physical A gesture helper: apply volume change immediately (live). */
+static void phya_volume_apply(int pct)
+{
+    muse_audio_set_volume(pct);  /* live, no NVS yet */
+    s_phya_vol_live = true;
+}
+
+/* Physical A gesture helper: persist volume after gesture completes. */
+static void phya_volume_commit(void)
+{
+    if (s_phya_vol_live && s_phya_live_vol >= 0) {
+        muse_settings_set_volume(s_phya_live_vol);
+        s_phya_vol_live = false;
+        s_phya_live_vol = -1;
+    }
+}
+
 static unsigned poll_buttons(void)
 {
+    unsigned ev = 0;
+
+    /* ---- PHYSICAL B (P0.2): PTT path. UNCHANGED. ---- */
     uint8_t in0 = 0xFF;
-    if (tca_read_reg(TCA9555_REG_INPUT0, &in0) != ESP_OK) {
-        return 0;
+    if (tca_read_reg(TCA9555_REG_INPUT0, &in0) == ESP_OK) {
+        bool raw = !(in0 & (1u << TCA_BTNA_BIT));  /* TCA_BTNA_BIT = P0.2 = PHYSICAL B */
+        if (raw != s_a_pressed) {
+            if (++s_a_stable >= 3) {
+                s_a_stable = 0;
+                s_a_pressed = raw;
+                ev |= raw ? MUSE_BTN_TALK_PRESS : MUSE_BTN_TALK_RELEASE;
+            }
+        } else {
+            s_a_stable = 0;
+        }
     }
-    bool raw = !(in0 & (1u << TCA_BTNA_BIT));
-    if (raw == s_a_pressed) {
-        s_a_stable = 0;
-        return 0;
+
+    /* ---- PHYSICAL A (P1.4): gesture state machine. ---- */
+    uint8_t in1 = 0xFF;
+    bool phya_raw = s_phya_pressed;  /* default: no change */
+    if (tca_read_reg(TCA9555_REG_INPUT1, &in1) == ESP_OK) {
+        phya_raw = !(in1 & (1u << PHYSICAL_A_BIT));  /* P1.4 active-low */
     }
-    if (++s_a_stable < 3) {
-        return 0;
+    /* Debounce */
+    if (phya_raw != s_phya_pressed) {
+        if (++s_phya_stable >= PHYA_DEBOUNCE_TICKS) {
+            s_phya_stable = 0;
+            bool was = s_phya_pressed;
+            s_phya_pressed = phya_raw;
+            bool menu_open = muse_menu_is_open();
+
+            if (phya_raw && !was) {
+                /* PRESS edge */
+                s_phya_hold = 0;
+                s_phya_repeat = 0;
+                s_phya_long = false;
+                s_phya_live_vol = -1;
+                if (menu_open) {
+                    /* In menu: A short = next item (existing behavior via menu_button).
+                     * Return AUX_PRESS so muse_input.c calls menu_button() ->
+                     * muse_menu_key(MUSE_MENU_DOWN). */
+                    ev |= MUSE_BTN_AUX_PRESS;
+                }
+                /* In normal mode: wait to distinguish short/long/double. No event yet. */
+            } else if (!phya_raw && was) {
+                /* RELEASE edge */
+                if (menu_open) {
+                    ev |= MUSE_BTN_AUX_RELEASE;
+                } else if (s_phya_long) {
+                    /* Was in long-press mode: persist volume, done. No click. */
+                    phya_volume_commit();
+                    int v = muse_settings_volume();
+                    ESP_LOGI("VOL", "volume: %d%%", v);
+                } else {
+                    /* Short release: check for double-click */
+                    if (s_phya_double > 0) {
+                        /* Double-click: open menu. Do NOT volume-down. */
+                        s_phya_double = 0;
+                        ev |= MUSE_BTN_AUX_PRESS;  /* triggers menu open via menu_button() */
+                        /* Note: menu_button() on press calls muse_menu_key(MUSE_MENU_DOWN)
+                         * which opens the menu. We don't want the DOWN action, just open.
+                         * The menu opens on first DOWN; this is the existing behavior for
+                         * aux button on non-touch boards. */
+                    } else {
+                        /* First click: start double-click window. Volume-down deferred. */
+                        s_phya_double = PHYA_DOUBLE_TICKS;
+                    }
+                }
+                s_phya_hold = 0;
+                s_phya_long = false;
+            }
+        }
+    } else {
+        s_phya_stable = 0;
     }
-    s_a_stable = 0;
-    s_a_pressed = raw;
-    return raw ? MUSE_BTN_TALK_PRESS : MUSE_BTN_TALK_RELEASE;
+
+    /* Physical A held: check for long-press and repeat (normal mode only) */
+    if (s_phya_pressed && !muse_menu_is_open()) {
+        s_phya_hold++;
+        if (!s_phya_long && s_phya_hold >= PHYA_LONG_TICKS) {
+            /* Enter long-press mode: volume UP (do NOT do volume-down first) */
+            s_phya_long = true;
+            s_phya_double = 0;  /* cancel pending double-click */
+            s_phya_live_vol = muse_settings_volume() + PHYA_VOL_STEP;
+            if (s_phya_live_vol > 100) s_phya_live_vol = 100;
+            phya_volume_apply(s_phya_live_vol);
+            ESP_LOGI("VOL", "volume: %d%%", s_phya_live_vol);
+            s_phya_repeat = 0;
+        } else if (s_phya_long) {
+            s_phya_repeat++;
+            if (s_phya_repeat >= PHYA_REPEAT_TICKS) {
+                s_phya_repeat = 0;
+                if (s_phya_live_vol < 0) s_phya_live_vol = muse_settings_volume();
+                s_phya_live_vol += PHYA_VOL_STEP;
+                if (s_phya_live_vol > 100) s_phya_live_vol = 100;
+                phya_volume_apply(s_phya_live_vol);
+                ESP_LOGI("VOL", "volume: %d%%", s_phya_live_vol);
+            }
+        }
+    }
+
+    /* Double-click timeout: if window expires with no second press, do volume-down */
+    if (s_phya_double > 0 && !s_phya_pressed) {
+        s_phya_double--;
+        if (s_phya_double == 0 && !muse_menu_is_open()) {
+            /* Single short press confirmed: volume DOWN */
+            int v = muse_settings_volume() - PHYA_VOL_STEP;
+            if (v < 0) v = 0;
+            muse_settings_set_volume(v);  /* persist immediately (infrequent) */
+            ESP_LOGI("VOL", "volume: %d%%", v);
+        }
+    }
+
+    return ev;
 }
 
 static esp_err_t power_off(void)

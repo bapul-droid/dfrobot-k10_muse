@@ -1,72 +1,90 @@
-<!--
-Copyright (c) Meta Platforms, Inc. and affiliates.
+# UNIHIKER K10 sebagai Muse Gadget (df-k10)
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+Port native board **DFRobot UNIHIKER K10** ke [muse-gadget-sdk](https://github.com/facebookincubator/muse-gadget-sdk).
+README ini menggantikan README generik upstream — isinya spesifik board df-k10: pin mapping,
+hasil bring-up, dan foto hardware asli.
 
-    http://www.apache.org/licenses/LICENSE-2.0
+> **Status (2026-10-06): stage-1 bring-up SELESAI & terverifikasi hardware.**
+> Eksperimen saat ini PAUSED — daily driver = firmware k10-genius.
+> Repo ini disimpan sebagai referensi port + donor LCD/UI.
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
+## Foto hardware
 
-# Muse Gadgets
+![Menu sistem di LCD K10](docs/img/k10-menu-sistem.jpg)
+*Menu sistem: Phone setup, Wi-Fi, Status, Battery, Reset pairing, Screen off*
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset=".github/images/muse-gadgets-dark.png">
-    <img src=".github/images/muse-gadgets-light.png" width="900" alt="Muse gadgets: a Waveshare round AMOLED, an M5Stack StickS3, Muse Home Link, a Raspberry Pi and a Seeed reTerminal e-ink display">
-  </picture>
-</p>
+![Menu audio di LCD K10](docs/img/k10-menu-audio.jpg)
+*Menu audio & daya: Volume 90%, Speaker On, Brightness 100%, Mic gain 30 dB, Auto-sleep 2 min*
 
-Muse gadgets are open source devices you build yourself. Program an
-off-the-shelf ESP32 board or set up a Raspberry Pi with our device SDKs, then
-connect Muse to your displays, buttons, sensors, actuators, and whatever else
-you've got lying on your workbench.
+![Layar Wi-Fi setup](docs/img/k10-wifi-setup.jpg)
+*Layar SET UP WI-FI — BLE advertise sebagai `MuseGadget-0DBE90`*
 
-We open sourced the SDKs and firmware here. It's built by hackers, for hackers,
-just for fun. Side effects of tinkering may include bricked boards, voided
-warranties, brownouts, or bankruptcies. Proceed at your own risk!
+## Spesifikasi board
 
-| | |
+| Item | Nilai |
 |---|---|
-| [**ESP32 Device SDK**](esp32) | Connect your ESP32 board to Muse through our open source SDK. Throw in a screen to show images, add audio in and out, or wire up other sensors. |
-| [**Linux Device SDK**](linux) | Turn that spare Raspberry Pi or Linux box into a Muse gadget. Hack in your own commands to let Muse handle sysadmin chores or your Home Assistant setup. |
+| Board | DFRobot UNIHIKER K10 |
+| Chip | ESP32-S3N16R8 (16 MB flash, 8 MB **octal** PSRAM) |
+| LCD | ILI9341 240×320, SPI3 (MOSI 21, SCLK 12, CS 14, DC 13, RST NC) |
+| Backlight | TCA9555 I/O expander @0x20 (I2C1), pin P0 — **ON/OFF saja** (tanpa PWM) |
+| I2C | I2C_NUM_1: SDA 47, SCL 48 |
+| I2S | I2S0: MCLK 3, BCLK 0, WS 38, DOUT 45, DIN 39 — 16 kHz / 16-bit |
+| Speaker | `esp_codec_dev`, raw I2S TX — ES8311 **tidak** di-init via I2C (tidak menjawab @0x18) |
+| Mic | ES7210 @0x23, RX TDM mode |
+| Tombol A / B | Expander pin P0.2 / P1.4, active-low (A = PTT / talk button) |
+| Firmware | `muse-gadget.bin` ±2052 KB — muat nyaman di flash 16 MB |
 
-Before you flash or pair a gadget, get an
-[SDK token](https://gadgets.muse.ai/settings/sdk-tokens) and review the
-[Gadget SDK Terms](https://gadgets.muse.ai/sdk-terms). Every gadget needs a
-token to pair.
+## Yang sudah dicapai (stage-1, [HW] terverifikasi)
 
-ESP32 and Linux gadgets pair with the Muse app on iOS and Android, via
-Settings > Devices. Turn on Developer mode there first, then look for devices
-prefixed with "MuseGadget".
-Each directory has a `README.md` to get started and an `AGENTS.md` for coding
-agents like [Muse Code](https://developer.meta.com/ai/lp/muse-code/).
+- ✅ Boot stabil — PSRAM 8 MB octal terdeteksi
+- ✅ LCD ILI9341 tampil — menu sistem + layar Wi-Fi setup (lihat foto)
+- ✅ BLE pairing — terdeteksi sebagai `MuseGadget-0DBE90`
+- ✅ Wi-Fi scan & connect OK
+- ✅ Voice pipeline (mic → Muse → speaker) jalan
+- ✅ Percakapan native Muse 1 putaran OK
+- ✅ Local TTS (`CONFIG_MUSE_LOCAL_TTS`) — suara `id-ID-GadisNeural` via server LAN
+- ✅ Build bersih, zero warnings (ESP-IDF v6.0.1) — commit `4b63dc5`
 
-## Community
+## Keterbatasan yang diketahui
 
-Meet other hackers who are building and customizing Muse gadgets in our
-community [Discord](https://discord.gg/3bhjCkZdd6). Get inspired, support each
-other, and share what you make.
+- 📷 **Kamera dinonaktifkan** (`#if 0`) — DMA kamera VGA (~30 KB) membuat LVGL display
+  buffer (15 KB) kelaparan → bootloop. Butuh redesign alokasi DMA, di luar scope stage-1.
+- 🗣️ **STT Bahasa Indonesia belum** — `/chat/stream` tidak mengirim language field
+  (SDK issue #164, masih OPEN di upstream); Azure ditolak (tanpa kartu kredit);
+  self-host Whisper ditolak (server kekecilan).
+- 💡 Backlight hanya ON/OFF — keterbatasan hardware, bukan bug.
+- 🔋 Tidak ada ADC baterai di board ini.
 
-## License
+## Build & flash
 
-Muse Gadgets is licensed under the Apache License, Version 2.0, found in
-[`LICENSE`](LICENSE), except for these third-party files, which keep their
-upstream licenses:
+Workspace: `D:\ESP-PROJECTS\ACTIVE\k10-muse` · Toolchain: ESP-IDF v6.0.1
 
-| Path | Upstream | License |
-|---|---|---|
-| [`esp32/components/minimp3/include/minimp3.h`](esp32/components/minimp3) | [lieff/minimp3](https://github.com/lieff/minimp3) | CC0-1.0, see [`LICENSE`](esp32/components/minimp3/LICENSE) |
-| [`esp32/main/pixel_font.c`](esp32/main/pixel_font.c) | Adafruit GFX `glcdfont.c` | BSD-2-Clause, in the file header |
+```bat
+build_k10.bat
+```
 
-Dependencies fetched at build time are under their own licenses: ESP-IDF
-components (into `esp32/managed_components/`), and the simulator's LVGL and
-SDL (listed in [`esp32/simulator/THIRD_PARTY.md`](esp32/simulator/THIRD_PARTY.md)).
+atau manual:
 
-The Apache License does not cover the [Jollybot avatar](esp32/avatar).
+```sh
+idf.py -B build-muse-unihiker-k10 -DIDF_TARGET=esp32s3 \
+  -DSDKCONFIG=build-muse-unihiker-k10/sdkconfig \
+  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;devices/sdkconfig.muse;devices/sdkconfig.muse-unihiker-k10" \
+  build
+idf.py -B build-muse-unihiker-k10 -p COM14 flash
+```
+
+> Ganti `COM14` dengan port K10 masing-masing.
+> Jangan tekan/hold tombol BOOT (GPIO0) saat operasi normal — pin ini = I2S BCLK.
+
+## File yang ditambahkan untuk board ini
+
+| File | Isi |
+|---|---|
+| `esp32/components/muse/boards/board_unihiker_k10.c` | Implementasi `muse_board_t` (init, display, audio, tombol via expander) |
+| `esp32/devices/sdkconfig.muse-unihiker-k10` | Overlay: esp32s3, board select, flash 16 MB, octal PSRAM |
+| `docs/img/` | Foto hardware (asli, tanpa edit) |
+
+## Referensi
+
+- Upstream SDK: [facebookincubator/muse-gadget-sdk](https://github.com/facebookincubator/muse-gadget-sdk)
+- SDK token & pairing: lihat README upstream (setiap gadget butuh token untuk pair)
